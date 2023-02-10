@@ -27,8 +27,6 @@ def _dequantize_per_tensor_impl(
 ) -> torch.Tensor:
     return (input.to(torch.float32) - zero_point) * scale
 
-
-
 # Note: decomposed means decomposed quantized tensor, using decomposed so that the
 # name is not too long
 quantized_decomposed_lib = Library("quantized_decomposed", "DEF")
