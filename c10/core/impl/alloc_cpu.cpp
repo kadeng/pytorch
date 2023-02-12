@@ -70,6 +70,31 @@ void* alloc_cpu(size_t nbytes) {
       "DefaultCPUAllocator: not enough memory: you tried to allocate ",
       nbytes,
       " bytes.");
+#elif defined(__linux__)
+  int err = 0;
+  if (nbytes >= gAlloc_threshold_thp) {
+    // inorder to enable thp, buffers need to be page aligned
+    err = posix_memalign(&data, gAlignment_thp, nbytes);
+  } else {
+    err = posix_memalign(&data, gAlignment, nbytes);
+  }
+  CAFFE_ENFORCE(
+      err == 0,
+      "DefaultCPUAllocator: can't allocate memory: you tried to allocate ",
+      nbytes,
+      " bytes. Error code ",
+      err,
+      " (",
+      strerror(err),
+      ")");
+  // enable thp (transparent huge pages) for larger buffers
+  if (nbytes >= gAlloc_threshold_thp) {
+    int ret = madvise(data, nbytes, MADV_HUGEPAGE);
+    if (ret != 0) {
+      TORCH_WARN_ONCE(
+          "thp madvise for HUGEPAGE failed with %s\n", strerror(errno));
+    }
+  }
 #else
   int err = posix_memalign(&data, gAlignment, nbytes);
   CAFFE_ENFORCE(
