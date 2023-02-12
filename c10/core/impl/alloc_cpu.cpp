@@ -72,7 +72,7 @@ void* alloc_cpu(size_t nbytes) {
       " bytes.");
 #elif defined(__linux__)
   int err = 0;
-  if (nbytes >= gAlloc_threshold_thp) {
+  if (gIs_c10_thp_mem_alloc_enabled && nbytes >= gAlloc_threshold_thp) {
     // inorder to enable thp, buffers need to be page aligned
     err = posix_memalign(&data, gAlignment_thp, nbytes);
   } else {
@@ -88,7 +88,7 @@ void* alloc_cpu(size_t nbytes) {
       strerror(err),
       ")");
   // enable thp (transparent huge pages) for larger buffers
-  if (nbytes >= gAlloc_threshold_thp) {
+  if (gIs_c10_thp_mem_alloc_enabled && nbytes >= gAlloc_threshold_thp) {
     int ret = madvise(data, nbytes, MADV_HUGEPAGE);
     if (ret != 0) {
       TORCH_WARN_ONCE(
