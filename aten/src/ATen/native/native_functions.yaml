@@ -9130,6 +9130,7 @@
   structured_inherits: TensorIteratorBase
   dispatch:
     CPU, CUDA: fmod_out
+    MPS: fmod_mps_out
   tags: pointwise
 
 - func: fmod.Tensor(Tensor self, Tensor other) -> Tensor
