@@ -7,6 +7,7 @@ import os
 import re
 from collections import defaultdict
 from typing import Any, Callable, Dict, List, Optional, Union
+import importlib
 
 import torch
 import torch._guards
@@ -26,6 +27,7 @@ from ..fx import Transformer
 from . import config
 from .decomposition import select_decomp_table
 from .lowering import fallback_node_due_to_unsupported_type
+from copy import deepcopy
 
 log = logging.getLogger(__name__)
 aten = torch.ops.aten
@@ -40,6 +42,11 @@ MULTIPLE = object()
 # graph will preserve the key from the first node in the original pattern.
 preserve_meta_keys = {"recompute"}
 
+matcher_callbacks : List[Callable] = []
+
+def on_partial_match(match : Union['Match','FailedMatch']):
+    for callback in matcher_callbacks:
+        callback(match)
 
 class Match:
     """
@@ -57,6 +64,7 @@ class Match:
         # Mapping CallFunction to the node.target
         self.targets = {}
         self.ctx: MatchContext = None
+        on_partial_match(self)
 
     @property
     def graph(self):
@@ -114,9 +122,12 @@ class Match:
 
 
 class FailedMatch(RuntimeError):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        on_partial_match(self)
     def __bool__(self):
         return False
-
 
 class MatchContext:
     """
@@ -488,7 +499,8 @@ class MultiOutputPattern(PatternExpr):
         return self.outputs[0].fns
 
     def __repr__(self):
-        return f"{self.__class__.__name__}({self.outputs})"
+        output_str = ",\n".join([repr(o) for o in self.outputs])
+        return f"{self.__class__.__name__}({output_str})"
 
     def _match(self, node: torch.fx.Node, ctx: MatchContext):
         m = ctx.match(self.outputs[0], node)
@@ -565,6 +577,7 @@ class PatternEntry:
 
     def register(self, pass_dicts, target=None, prepend=False):
         if target is None:
+            assert hasattr(self.pattern, "fns"), "pattern must have fns attribute if no target is specified"
             for fn in self.pattern.fns:
                 self.register(pass_dicts, fn, prepend=prepend)
         elif isinstance(pass_dicts, (dict, PatternMatcherPass)):
@@ -685,17 +698,15 @@ class ReplacementPatternEntry(PatternEntry):
 def _return_true(match):
     return True
 
-
-def register_replacement(
-    search_fn,
-    replace_fn,
-    example_inputs,
-    trace_fn,
-    pass_dict,
+def create_replacement_pattern_from_functions(
+    search_fn : Callable,
+    replace_fn : Callable,
+    example_inputs : Any,
+    trace_fn : Callable,
     extra_check=_return_true,
     scalar_workaround=(),
     exclusive_arg_names=(),
-):
+) -> ReplacementPatternEntry:
     """
     Create a replacement rule based on example functions that get traced
     to create patterns.  This supports both training and inference when
@@ -705,9 +716,11 @@ def register_replacement(
         search_fn: traced to give original pattern
         replace_fn: traced to give replacement graph
         example_inputs: example inputs for initial trace
-        trace_fn: inference_graph or training_graph
+        trace_fn: inference_graph or training_graph function
         pass_dict: dict of passes to register to
         extra_check: additional check to run on match(using real shapes)
+    Returns:
+        ReplacementPatternEntry
     """
 
     def check_fn(match: Match):
@@ -762,21 +775,58 @@ def register_replacement(
             isinstance(x, torch.Tensor) and x.requires_grad for x in example_inputs
         ]
         search_gm = trace_fn(search_fn, example_inputs)
-        pattern = fx_to_pattern(
+        pattern_expr: PatternExpr = fx_to_pattern(
             search_gm,
             ignore_types=(int, float, list, torch.device, torch.dtype),
             argnames=argnames,
             scalar_workaround=scalar_workaround,
             exclusive_arg_names=exclusive_arg_names,
         )
-        assert repr(pattern) not in _seen_patterns
-        _seen_patterns.add(repr(pattern))
-        pattern = ReplacementPatternEntry(
-            pattern=pattern,
+
+        pattern: ReplacementPatternEntry = ReplacementPatternEntry(
+            pattern=pattern_expr,
             extra_check=check_fn,
             normalize_args=normalize_args,
         )
-        pattern.register(pass_dict)
+        return pattern
+
+def register_replacement(
+    search_fn,
+    replace_fn,
+    example_inputs,
+    trace_fn,
+    pass_dict,
+    extra_check=_return_true,
+    scalar_workaround=(),
+    exclusive_arg_names=(),
+):
+    """
+    Create and register a replacement rule based on example functions that get traced
+    to create patterns.  This supports both training and inference when
+    run on a joint foward+backward graph.
+
+    Args:
+        search_fn: traced to give original pattern
+        replace_fn: traced to give replacement graph
+        example_inputs: example inputs for initial trace
+        trace_fn: inference_graph or training_graph
+        pass_dict: dict of passes to register to
+        extra_check: additional check to run on match(using real shapes)
+    """
+    global _seen_patterns
+    pattern = create_replacement_pattern_from_functions(
+        search_fn,
+        replace_fn,
+        example_inputs,
+        trace_fn,
+        extra_check=extra_check,
+        scalar_workaround=scalar_workaround,
+        exclusive_arg_names=exclusive_arg_names,
+    )
+    pattern_expr = pattern.pattern
+    assert repr(pattern_expr) not in _seen_patterns
+    _seen_patterns.add(repr(pattern_expr))
+    pattern.register(pass_dict)
 
 
 def register_lowering_pattern(
@@ -923,7 +973,7 @@ def _not_implemented(*args, **kwargs):
 
 def fx_to_pattern(
     gm, ignore_types=(), argnames=(), scalar_workaround=(), exclusive_arg_names=()
-):
+) -> PatternExpr:
     """
     Convert an FX graph into a PatternExpr.  This is useful for simple
     patterns that can only match single functions and fixed length lists.
@@ -1127,3 +1177,59 @@ def filter_nodes(nodes, fn):
         fns.extend([getattr(fn, overload) for overload in fn.overloads()])
 
     return [node for node in nodes if node.target in fns]
+
+
+class _StopCompilationException(BaseException):
+    """Custom exception to stop compilation of a function"""
+    pass
+
+
+class CaptureFunction:
+    """
+    Context manager for tracing purposes, which captures
+    global function call inputs and outputs without interfering with
+    the captured function, which will be called and return as usual.
+    """
+
+    def __init__(self, patch_function_name,
+                 on_enter: Optional[Callable] = None,
+                 on_exit: Optional[Callable] = None):
+        self.patch_function_name = patch_function_name
+        self.on_enter = on_enter
+        self.on_exit = on_exit
+        pparts = patch_function_name.split(".")
+        package_name = ".".join(pparts[:-1])
+        func_name = pparts[-1]
+        self.wrapped_package = importlib.import_module(package_name)
+        self.wrapped_original_fn = self.wrapped_package.__dict__[func_name]
+
+    def __enter__(self):
+        self._patch_ctx = mock.patch(self.patch_function_name, self)
+        return self._patch_ctx.__enter__()
+
+    def __exit__(self, *args, **kwargs):
+        return self._patch_ctx.__exit__(*args, **kwargs)
+
+    def __call__(self, *args, **kwargs):
+        if self.on_enter is not None:
+            self.on_enter(*args, **kwargs)
+        ret = self.wrapped_original_fn(*args, **kwargs)
+        if self.on_exit is not None:
+            self.on_exit(ret)
+        return ret
+def joint_graph_fx(func, args):
+    captured_gm: torch.fx.GraphModule = None
+
+    def capture_graph_module(gm: torch.fx.GraphModule, *_args, **_kwargs):
+        nonlocal captured_gm
+        captured_gm = deepcopy(gm)
+        raise _StopCompilationException()
+
+    try:
+        with CaptureFunction('torch._inductor.compile_fx.joint_graph_passes', on_enter=capture_graph_module):
+            fn = torch.compile(func, backend='inductor', fullgraph=True)
+            res = fn(*args)
+        assert False, "this point should not be reached"
+    except _StopCompilationException:
+        pass
+    return captured_gm

@@ -9,7 +9,11 @@ from ..pattern_matcher import (
     inference_graph,
     register_replacement,
     training_graph,
+    ReplacementPatternEntry,
+    create_replacement_pattern_from_functions
 )
+from collections import namedtuple
+from typing import List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 aten = torch.ops.aten
@@ -258,6 +262,50 @@ def _sfdp_replacement_10(query, key, value):
         is_causal=False,
     )
 
+def _sfdp_pattern_11(
+                       query : torch.Tensor,
+                       key : torch.Tensor,
+                       value : torch.Tensor,
+                       causal_mask : torch.Tensor,
+                       # scale : float,
+                       dropout_p : float):
+    attn_weights = torch.matmul(query, key.transpose(-1, -2))
+
+    attn_weights = attn_weights / torch.full(
+        [], 1.0, dtype=attn_weights.dtype, device=attn_weights.device
+    )
+    mask_value = torch.finfo(attn_weights.dtype).min
+    mask_value = torch.full([], mask_value, dtype=attn_weights.dtype).to(attn_weights.device)
+    attn_weights = torch.where(causal_mask, attn_weights.to(attn_weights.dtype), mask_value)
+
+    attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
+
+    # Downcast (if necessary) back to V's dtype (if in mixed-precision) -- No-Op otherwise
+    attn_weights = attn_weights.type(value.dtype)
+    attn_weights = torch.nn.functional.dropout(attn_weights, dropout_p, True, False)
+
+    attn_output = torch.matmul(attn_weights, value)
+
+    return attn_output
+
+def _sfdp_replacement_11(
+                       query : torch.Tensor,
+                       key : torch.Tensor,
+                       value : torch.Tensor,
+                       causal_mask : torch.Tensor,
+                       # scale : float,
+                       dropout_p : float):
+    counters["inductor"]["fuse_attention"] += 1
+    return aten.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=causal_mask.to(torch.bool),
+        dropout_p=dropout_p,
+        is_causal=False,
+    )
+    return attn_output
+
 
 def _sfdp_params_check(match):
     assert all(k in match.kwargs for k in ("query", "key", "value"))
@@ -298,11 +346,9 @@ def _sfdp_scale_factor_check(scale_factor_op):
 
     return fn
 
+ReplacementInfo = namedtuple('ReplacementInfo', ['pattern', 'replacement', 'args', 'workaround', 'extra_check'])
 
-@functools.lru_cache(None)
-def _sfdp_init():
-    from .joint_graph import patterns
-
+def _create_sfdp_replacement_patterns() -> List[ReplacementInfo]:
     if torch.cuda.is_available():
         # workaround https://github.com/pytorch/pytorch/issues/97894
         device = "cuda"
@@ -317,83 +363,123 @@ def _sfdp_init():
     )
     b = functools.partial(torch.empty, (1, 1, 8, 8), device=device)
     c = functools.partial(torch.tensor, 2.0, device=device)
+    pdrop = functools.partial(torch.tensor, 0.1, device=device)
+    bool_scalar = lambda: True
+    mask_tensor = functools.partial(
+        torch.empty, (1, 1, 8, 8), device=device, requires_grad=False, dtype=torch.bool
+    )
     # workaround https://github.com/pytorch/pytorch/issues/97894
     # 0.113377 is a "magic" value that lets us recover the lost input arg relationship
     d = {"dropout_p": 0.113377}
+    # same here, except we need another magic value for scale
+    ds = {"scale": 1.113377, "dropout_p": 0.113377}
 
-    for pattern, replacement, args, workaround, extra_check in [
-        (
-            _sfdp_pattern_1,
-            _sfdp_replacement_1,
-            [g(), g(), g(), c()],
-            {},
-            _sfdp_scale_factor_check(aten.div.Tensor),
+    return [
+        ReplacementInfo(
+                _sfdp_pattern_1,
+                _sfdp_replacement_1,
+                [g(), g(), g(), c()],
+                {},
+                _sfdp_scale_factor_check(aten.div.Tensor),
         ),
-        (
-            _sfdp_pattern_2,
-            _sfdp_replacement_2,
-            [g(), g(), g(), c()],
-            {},
-            _sfdp_scale_factor_check(aten.mul.Tensor),
+        ReplacementInfo(
+                _sfdp_pattern_2,
+                _sfdp_replacement_2,
+                [g(), g(), g(), c()],
+                {},
+                _sfdp_scale_factor_check(aten.mul.Tensor),
         ),
-        (
-            _sfdp_pattern_3,
-            _sfdp_replacement_3,
-            [g(), g(), g(), c()],
-            d,
-            _sfdp_scale_factor_check(aten.div.Tensor),
+        ReplacementInfo(
+                _sfdp_pattern_3,
+                _sfdp_replacement_3,
+                [g(), g(), g(), c()],
+                d,
+                _sfdp_scale_factor_check(aten.div.Tensor),
         ),
-        (
-            _sfdp_pattern_4,
-            _sfdp_replacement_4,
-            [g(), g(), g(), c()],
-            d,
-            _sfdp_scale_factor_check(aten.mul.Tensor),
+        ReplacementInfo(
+                _sfdp_pattern_4,
+                _sfdp_replacement_4,
+                [g(), g(), g(), c()],
+                d,
+                _sfdp_scale_factor_check(aten.mul.Tensor),
         ),
-        (
-            _sfdp_pattern_5,
-            _sfdp_replacement_5,
-            [g(), g(), g(), b()],
-            {},
-            _sfdp_params_check,
+        ReplacementInfo(
+                _sfdp_pattern_5,
+                _sfdp_replacement_5,
+                [g(), g(), g(), b()],
+                {},
+                _sfdp_params_check,
         ),
-        (
-            _sfdp_pattern_6,
-            _sfdp_replacement_6,
-            [g(), g(), g(), b()],
-            d,
-            _sfdp_params_check,
+        ReplacementInfo(
+                _sfdp_pattern_6,
+                _sfdp_replacement_6,
+                [g(), g(), g(), b()],
+                d,
+                _sfdp_params_check,
         ),
-        (
-            _sfdp_pattern_7,
-            _sfdp_replacement_7,
-            [gp(), gp(), gp()],
-            d,
-            _sfdp_params_check,
+        ReplacementInfo(
+                _sfdp_pattern_7,
+                _sfdp_replacement_7,
+                [gp(), gp(), gp()],
+                d,
+                _sfdp_params_check,
         ),
-        (
-            _sfdp_pattern_8,
-            _sfdp_replacement_8,
-            [gp(), gp(), gp()],
-            {},
-            _sfdp_params_check,
+        ReplacementInfo(
+                _sfdp_pattern_8,
+                _sfdp_replacement_8,
+                [gp(), gp(), gp()],
+                {},
+                _sfdp_params_check,
         ),
-        (
-            _sfdp_pattern_9,
-            _sfdp_replacement_9,
-            [gp(), gp(), gp()],
-            d,
-            _sfdp_params_check,
+        ReplacementInfo(
+                _sfdp_pattern_9,
+                _sfdp_replacement_9,
+                [gp(), gp(), gp()],
+                d,
+                _sfdp_params_check,
         ),
-        (
-            _sfdp_pattern_10,
-            _sfdp_replacement_10,
-            [gp(), gp(), gp()],
-            {},
-            _sfdp_params_check,
+        ReplacementInfo(
+                _sfdp_pattern_10,
+                _sfdp_replacement_10,
+                [gp(), gp(), gp()],
+                {},
+                _sfdp_params_check,
         ),
-    ]:
+        ReplacementInfo(
+                _sfdp_pattern_11,
+                _sfdp_replacement_11,
+                [g(), g(), g(), mask_tensor()],
+                d,
+                _sfdp_params_check,
+        ),
+    ]
+
+def replacement_pattern_from_replacement_info(rinfo : ReplacementInfo, inference : bool = False ) -> ReplacementPatternEntry:
+    if inference:
+        trace_fn = inference_graph
+    else:
+        trace_fn = training_graph
+    pattern, replacement, non_workaround_args, workaround, extra_check = rinfo
+    args = [*non_workaround_args, *workaround.values()]
+    return create_replacement_pattern_from_functions(
+        pattern,
+        replacement,
+        args,
+        trace_fn,
+        extra_check=extra_check,
+        scalar_workaround=workaround,
+    )
+
+@functools.lru_cache(None)
+def _sfdp_init():
+    from ..._dynamo.utils import counters
+
+    counters_ref = counters["inductor"].copy()
+    from .joint_graph import patterns
+
+    for pattern, replacement, args, workaround, extra_check in _create_sfdp_replacement_patterns():
         args = [*args, *workaround.values()]
+
         register_replacement(
             pattern,
             replacement,
@@ -412,3 +498,7 @@ def _sfdp_init():
             extra_check=extra_check,
             scalar_workaround=workaround,
         )
+
+    counters[
+        "inductor"
+    ] = counters_ref  # clear view matches encountered during sdpa tracing

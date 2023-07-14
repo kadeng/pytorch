@@ -410,6 +410,8 @@ def _compile(
     output: Optional[OutputGraph] = None
     # This is shared across restarts
     mutated_closure_cell_contents: Set[str] = set()
+    if frame is not None and frame_state is not None and hasattr(frame, "f_func") and hasattr(frame.f_func, "__annotations__"):
+        frame_state["__annotations__"] = frame.f_func.__annotations__
 
     # from .utils import print_once;  print_once(code.co_filename)
 

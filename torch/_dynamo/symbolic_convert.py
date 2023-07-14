@@ -1997,7 +1997,10 @@ class InstructionTranslator(InstructionTranslatorBase):
             export=export,
             inline_depth=0,
         )
-
+        if frame_state and "__annotations__" in frame_state:
+            self.annotated = { id(f_locals[name]) : annotation for name, annotation in frame_state["__annotations__"].items() if name in f_locals }
+        else:
+            self.annotated = {}
         # as soon as we create the tracing context we should keep it active, so any calls
         # into dynamo apis can rely on finding it
         with tracing(self.output.tracing_context):

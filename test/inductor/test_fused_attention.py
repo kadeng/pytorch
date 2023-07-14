@@ -1,5 +1,7 @@
 # Owner(s): ["module: inductor"]
 import itertools
+from typing import Callable, List
+
 import math
 
 import torch
@@ -7,6 +9,9 @@ import torch._inductor.config
 from torch._dynamo.test_case import run_tests, TestCase
 from torch._dynamo.utils import counters
 from torch._inductor import config
+from torch._inductor.fx_passes.fuse_attention import _create_sfdp_replacement_patterns, ReplacementInfo, \
+    replacement_pattern_from_replacement_info
+from torch._inductor.pattern_matcher import PatternMatcherPass, ReplacementPatternEntry
 from torch._inductor.utils import run_and_get_code
 from torch.testing._internal.common_cuda import (
     PLATFORM_SUPPORTS_FUSED_SDPA,
@@ -14,7 +19,8 @@ from torch.testing._internal.common_cuda import (
 )
 from torch.testing._internal.common_utils import IS_LINUX, skipIfRocm
 from torch.testing._internal.inductor_utils import HAS_CUDA
-
+import unittest.mock as mock
+import logging
 
 @config.patch(fallback_random=True)
 class TestSDPAPatternRewriter(TestCase):
@@ -78,6 +84,49 @@ class TestSDPAPatternRewriter(TestCase):
                         and not has_dropout
                     ):
                         self.assertEqual(arg1.grad, arg2.grad, atol=atol, rtol=1.3e-6)
+
+    def _capture_joint_graph(self, fn, args1, training=True) -> torch.fx.GraphModule:
+        """
+        Capture the fx graph of a function as it passes through joint_graph.joint_graph_passes
+
+        :param fn: The function to capture the graph of
+        :param args1: The first set of arguments for the function
+        :param training: Indicates whether training mode is enabled or not (default: True)
+
+        :return: The captured graph of the function ( a torch.fx.Graph )
+        """
+        import torch._inductor.fx_passes
+        import torch._inductor.fx_passes.joint_graph
+        import torch._inductor.fx_passes.fuse_attention
+        old_pattern_matcher_cfg = torch._inductor.config.pattern_matcher
+        try:
+            torch._inductor.config.pattern_matcher = False # we don't want the pattern matcher to run
+            joint_graph_passes = torch._inductor.fx_passes.joint_graph.joint_graph_passes
+            captured_graph = None
+
+            def joint_graph_passes_patched(graph: torch.fx.GraphModule):
+                nonlocal captured_graph
+                res = joint_graph_passes(graph)
+                captured_graph = res
+                return res
+
+            args2 = self._clone_inputs(args1)
+
+            for x in itertools.chain(args1[:], args2[:]):
+                if isinstance(x, torch.Tensor) and x.is_floating_point():
+                    x.requires_grad = training
+
+
+            torch.manual_seed(1234)
+            with mock.patch('torch._inductor.fx_passes.joint_graph.joint_graph_passes', joint_graph_passes_patched):
+                result2, (source_code,) = run_and_get_code(
+                    torch.compile(fn, fullgraph=True), *args2
+                )
+            counters.clear()
+            assert captured_graph is not None, "No graph was captured"
+            return captured_graph
+        finally:
+            torch._inductor.config.pattern_matcher = old_pattern_matcher_cfg
 
     @skipIfRocm
     def test_sdpa_rewriter_1(self):
@@ -269,7 +318,6 @@ class TestSDPAPatternRewriter(TestCase):
             torch.randn((2, 8, 4, 16), device="cuda", dtype=torch.half),
             torch.randn((2, 8, 4, 16), device="cuda", dtype=torch.half),
         )
-
         self._check_common(sfdp_pattern_9, args, contains=SM80OrLater, atol=2e-3)
 
     @skipIfRocm
@@ -292,6 +340,54 @@ class TestSDPAPatternRewriter(TestCase):
         )
 
         self._check_common(sfdp_pattern_10, args, atol=2e-3)
+
+    def test_sdpa_rewriter_11(self):
+
+        # pattern should match huggingface GPT2Attention in certain configs
+        def sfdp_pattern_11(
+                query: torch.Tensor,
+                key: torch.Tensor,
+                value: torch.Tensor,
+                causal_mask: torch.Tensor,
+                # scale: float,
+                dropout_p: "symbolic_float"):
+            attn_weights = torch.matmul(query, key.transpose(-1, -2))
+
+            attn_weights = attn_weights / torch.full(
+                [], 1.0, dtype=attn_weights.dtype, device=attn_weights.device
+            )
+            mask_value = torch.finfo(attn_weights.dtype).min
+            mask_value = torch.full([], mask_value, dtype=attn_weights.dtype).to(attn_weights.device)
+            attn_weights = torch.where(causal_mask, attn_weights.to(attn_weights.dtype), mask_value)
+
+            attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
+
+            # Downcast (if necessary) back to V's dtype (if in mixed-precision) -- No-Op otherwise
+            attn_weights = attn_weights.type(value.dtype)
+            attn_weights = torch.nn.functional.dropout(attn_weights, dropout_p, True, False)
+
+            attn_output = torch.matmul(attn_weights, value)
+
+            return attn_output
+
+        args = (
+            torch.randn((2, 8, 4, 16), device="cuda", dtype=torch.float32),
+            torch.randn((2, 8, 4, 16), device="cuda", dtype=torch.float32),
+            torch.randn((2, 8, 4, 16), device="cuda", dtype=torch.float32),
+            torch.randn((1, 4, 4), device="cuda", dtype=torch.float32)>0.0,
+           # 2.0,
+            0.1,
+        )
+        #ris: List[ReplacementInfo] = _create_sfdp_replacement_patterns()
+
+        #graph = self._capture_joint_graph(sfdp_pattern_11, args, training=True)
+
+        #pmpass = PatternMatcherPass()
+        #repentry : ReplacementPatternEntry  = replacement_pattern_from_replacement_info(ris[-1], False)
+        #from torch._inductor.pattern_matcher import log
+        #repentry.register(pmpass)
+        #pmpass.apply(graph)
+        torch._dynamo.export(sfdp_pattern_11, *args)
 
     def test_pattern_fails_with_tensor_factor(self):
         # https://github.com/pytorch/pytorch/issues/99124

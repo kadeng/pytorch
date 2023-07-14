@@ -9,7 +9,7 @@ import logging
 import operator
 import re
 import types
-from typing import List, NamedTuple, Optional, Union
+from typing import List, NamedTuple, Optional, Union, Any
 
 import torch
 
@@ -180,7 +180,8 @@ class FrameStateSizeEntry:
 
 
 class VariableBuilder:
-    """Wrap a python value in a VariableTracker() instance"""
+    """Wrap a python value in a VariableTracker() instance. Called by InstructionTranslator in the constructor
+    on all used locals and globals of a frame into symbolic variables to be used in it's symbolic state machine."""
 
     def __init__(
         self,
@@ -195,8 +196,13 @@ class VariableBuilder:
         self.tx = tx
         self.source = source
         self.name = source.name()
+        if tx.frame_state and "__annotations__" in tx.frame_state:
+            self.annotation = tx.frame_state['__annotations__'][self.name]
+        else:
+            self.annotation = None
 
-    def __call__(self, value):
+    def __call__(self, value : Any) -> VariableTracker:
+        """Wrap a python value in a VariableTracker() instance. Called by InstructionTranslator in the constructor"""
         if value in self.tx.output.side_effects:
             side_effect_result = self.tx.output.side_effects[value]
             dup_guard = make_dupe_guard(self.source, side_effect_result.source)
@@ -342,7 +348,8 @@ class VariableBuilder:
 
         return result
 
-    def _wrap(self, value):
+    def _wrap(self, value : Any) -> VariableTracker:
+        """Do the actual wrapping"""
         make_guards = self.make_guards
 
         # Handle exact type() match
@@ -1346,6 +1353,10 @@ def wrap_fx_proxy_cls(
     ]:
         proxy.node.meta["example_value"] = example_value
         return ConstantVariable(example_value, **options)
+    elif hasattr(proxy.node.target, "_as_constant_var") and ConstantVariable.is_literal(example_value):
+        return ConstantVariable(example_value, **options)
+    elif hasattr(proxy.node.target, "_is_sym_arg") and ConstantVariable.is_literal(proxy.node.target._example_value):
+        return SymNodeVariable(proxy, proxy.node.target._example_value, **options)
     else:
         unimplemented(
             "torch.* op returned non-Tensor "

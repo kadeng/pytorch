@@ -1278,7 +1278,7 @@ def get_debug_dir():
     return _get_debug_dir(debug_root)
 
 
-def get_fake_value(node, tx):
+def get_fake_value(node : torch.fx.Node, tx : 'InstructionTranslator'):
     """
     Run the computation represented by `node` using fake tensors and return the result.
     """
@@ -1300,6 +1300,7 @@ def get_fake_value(node, tx):
     def visit(n: torch.fx.Node):
         return n.meta["example_value"]
 
+    # replace nodes with their example values from node.meta['example_value']
     args, kwargs = torch.fx.node.map_arg((node.args, node.kwargs), visit)
     args = tree_map(fake_wrapper, args)
     kwargs = tree_map(fake_wrapper, kwargs)
@@ -1359,7 +1360,7 @@ def get_fake_value(node, tx):
         raise TorchRuntimeError(str(e)).with_traceback(e.__traceback__) from None
 
 
-def run_node(tracer, node, args, kwargs, nnmodule):
+def run_node(tracer : torch.fx.Tracer, node : torch.fx.Node, args, kwargs, nnmodule):
     """
     Runs a given node, with the given args and kwargs.
 

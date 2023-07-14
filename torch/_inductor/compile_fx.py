@@ -283,6 +283,23 @@ def compile_fx_inner(
     user_visible_outputs=frozenset(),
     layout_opt=None,
 ):
+    """
+    Compile the given FX graph module into a compiled graph that can be executed efficiently.
+
+    :param gm: The FX graph module to compile.
+    :param example_inputs: List of example inputs used to trace the graph and infer shapes and types.
+    :param cudagraphs: Optional flag indicating whether to use CUDA graphs for graph execution. Defaults to the value of `config.triton.cudagraphs`.
+    :param num_fixed: Number of fixed inputs.
+    :param is_backward: Flag indicating whether the compilation is for a backward pass. Defaults to False.
+    :param graph_id: Identifier for the graph being compiled. Defaults to None.
+    :param cpp_wrapper: Flag indicating whether to use a C++ wrapper for the compiled graph. Defaults to False.
+    :param aot_mode: Flag indicating whether to compile the graph in AOT (ahead-of-time) mode. Defaults to False.
+    :param is_inference: Flag indicating whether the graph is being compiled for inference. Defaults to False.
+    :param boxed_forward_device_index: Optional device index for boxed forward execution. Defaults to None.
+    :param user_visible_outputs: Set of user-visible output nodes in the graph. Defaults to an empty set.
+    :param layout_opt: Optional layout optimization flag. Defaults to None.
+    :return: Either the compiled graph if `aot_mode` is True, or the compiled boxed function.
+    """
     if dynamo_utils.count_calls(gm.graph) == 0:
         return make_boxed_func(gm.forward)
 
