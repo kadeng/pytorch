@@ -251,6 +251,9 @@ def convert_frame_assert(
         if "_id" not in frame_state:
             frame_state["_id"] = FRAME_COUNTER
             FRAME_COUNTER += 1
+        # store function annotations in frame_state if present
+        if "__annotations__" not in frame_state and hasattr(frame, "f_func") and hasattr(frame.f_func, "__annotations__"):
+            frame_state["__annotations__"] = frame.f_func.__annotations__
 
         code = frame.f_code
 

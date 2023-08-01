@@ -9,7 +9,7 @@ import logging
 import operator
 import re
 import types
-from typing import List, NamedTuple, Optional, Union
+from typing import List, NamedTuple, Optional, Union, Any
 
 import torch
 
@@ -25,6 +25,7 @@ from torch.fx.experimental.symbolic_shapes import (
 from torch.fx.immutable_collections import immutable_list
 from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 from torch.utils.weak import TensorWeakRef, WeakIdRef
+from .param_decorators import PlaceholderAsScalar
 
 from .. import config, mutation_guard, replay_record, skipfiles
 from ..allowed_functions import is_allowed, is_builtin_callable, is_numpy
@@ -186,6 +187,7 @@ class VariableBuilder:
         self,
         tx,
         source: Source,
+        annotation : Optional[Any] = None # annotation entry from func.__annotations__ if available
     ):
         assert (
             source is not None
@@ -195,6 +197,7 @@ class VariableBuilder:
         self.tx = tx
         self.source = source
         self.name = source.name()
+        self.annotation = annotation
 
     def __call__(self, value):
         if value in self.tx.output.side_effects:
@@ -248,6 +251,9 @@ class VariableBuilder:
             torch.nn.ParameterList: ListVariable,
             torch.nn.ModuleList: ListVariable,
         }[type(value)]
+
+    def get_annotation(self) -> Optional[Any]:
+        return self.annotation
 
     def get_source(self):
         return self.source
@@ -915,18 +921,53 @@ class VariableBuilder:
                 stored_value = stored_value.add_guards(self.make_guards(dup_guard))
             return stored_value
 
-        tensor_proxy = self.tx.output.root_tracer.create_graph_input(
-            re.sub(r"[^a-zA-Z0-9]+", "_", self.name), type(value)
-        )
-        tensor_variable = wrap_fx_proxy(
-            tx=self.tx,
-            proxy=tensor_proxy,
-            example_value=value,
-            guards=self.make_guards(GuardBuilder.TENSOR_MATCH),
-            should_specialize=self.tensor_should_specialize(),
-            ignore_subclass=ignore_subclass,
-            source=source,
-        )
+        if isinstance(self.annotation, PlaceholderAsScalar):
+            # See PlaceholderAsScalar doc comment
+            # NOTE: This does not have to work or make sense for codegen
+            # purposes. The PlaceholderAsScalar annotation is only used for
+            # tracing / exporting a fx graph.
+
+            # Transform single element tensor to scalar of either int, float or bool type
+            scalar_example_value = self.annotation.example_value(value)
+            # extract it's type
+            typ = type(scalar_example_value)
+            # create a graph input with that scalar type
+            tensor_proxy = self.tx.output.root_tracer.create_graph_input(
+                re.sub(r"[^a-zA-Z0-9]+", "_", self.name), typ
+            )
+            # create a proxy for tracking purposes.
+            #
+            tensor_variable = wrap_fx_proxy(
+                tx=self.tx,
+                proxy=tensor_proxy,
+                example_value=value,
+                guards=None,
+                should_specialize=False,
+                ignore_subclass=True,
+                source=source,
+            )
+            # remember the scalar tensor example value for usage by
+            # GraphArg futher below
+            #
+            example_value = tensor_proxy.node.meta["example_value"]
+            # but set the example value used for tracing purposes to
+            # the scalar value we obtained.
+            tensor_proxy.node.meta["example_value"] = scalar_example_value
+        else:
+            tensor_proxy = self.tx.output.root_tracer.create_graph_input(
+                re.sub(r"[^a-zA-Z0-9]+", "_", self.name), type(value)
+            )
+            tensor_variable = wrap_fx_proxy(
+                tx=self.tx,
+                proxy=tensor_proxy,
+                example_value=value,
+                guards=self.make_guards(GuardBuilder.TENSOR_MATCH),
+                should_specialize=self.tensor_should_specialize(),
+                ignore_subclass=ignore_subclass,
+                source=source,
+            )
+            example_value = tensor_proxy.node.meta["example_value"]
+
         self.tx.output.input_source_to_var[source] = tensor_variable
         assert "tensor_dict" not in tensor_proxy.node.meta
         tensor_proxy.node.meta["tensor_dict"] = value.__dict__.copy()
@@ -934,7 +975,6 @@ class VariableBuilder:
         # TODO: I think the result is guaranteed to be fake with
         # ignore_subclass changes
         fake_tensor_value = None
-        example_value = tensor_variable.proxy.node.meta["example_value"]
         if is_fake(example_value):
             fake_tensor_value = example_value
 

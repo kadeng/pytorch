@@ -2011,11 +2011,18 @@ class InstructionTranslator(InstructionTranslatorBase):
 
             vars = list(code_options["co_varnames"])
             vars.extend(x for x in self.cell_and_freevars() if x not in vars)
+            
+            # annotations from function definition if available
+            annotations : Dict[str, Any]
+            if "__annotations__" in frame_state:
+                annotations = frame_state["__annotations__"]
+            else:
+                annotations = {}
 
             self.symbolic_locals = collections.OrderedDict(
                 (
                     k,
-                    VariableBuilder(self, LocalSource(k))(f_locals[k]),
+                    VariableBuilder(self, LocalSource(k), annotations.get(k, None))(f_locals[k]),
                 )
                 for k in vars
                 if k in f_locals
