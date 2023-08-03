@@ -3,6 +3,7 @@ import logging
 import math
 
 import torch
+from .joint_graph import pre_constant_fold_patterns
 from ..._dynamo.utils import counters
 from ..pattern_matcher import (
     filter_nodes,
@@ -10,6 +11,7 @@ from ..pattern_matcher import (
     register_replacement,
     training_graph,
 )
+from ..._dynamo.variables.param_decorators import PlaceholderAsScalar
 
 log = logging.getLogger(__name__)
 aten = torch.ops.aten
@@ -259,6 +261,49 @@ def _sfdp_replacement_10(query, key, value):
     )
 
 
+def _sfdp_pattern_11(
+        query,
+        key,
+        value,
+        causal_mask,
+        scale,
+        dropout_p):
+    attn_weights = torch.matmul(query, key.transpose(-1, -2))
+
+    attn_weights = attn_weights / torch.full(
+        [], scale, dtype=attn_weights.dtype, device=attn_weights.device
+    )
+    mask_value = torch.finfo(attn_weights.dtype).min
+    mask_value = torch.full([], mask_value, dtype=attn_weights.dtype).to(attn_weights.device)
+    attn_weights = torch.where(causal_mask, attn_weights.to(attn_weights.dtype), mask_value)
+
+    attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
+
+    attn_weights = attn_weights.type(value.dtype)
+    attn_weights = torch.nn.functional.dropout(attn_weights, dropout_p, True, False)
+
+    attn_output = torch.matmul(attn_weights, value)
+
+    return attn_output
+
+def _sfdp_replacement_11(
+        query,
+        key,
+        value,
+        causal_mask,
+        scale,
+        dropout_p):
+    return torch.sin(aten.scaled_dot_product_attention(
+        query.contiguous(),
+        key.contiguous(),
+        value.contiguous(),
+        attn_mask=causal_mask.to(torch.bool),
+        dropout_p=dropout_p,
+        is_causal=False,
+        scale=scale,
+    ))
+
+
 def _sfdp_params_check(match):
     assert all(k in match.kwargs for k in ("query", "key", "value"))
     query = match.kwargs["query"].meta["val"]
@@ -316,80 +361,100 @@ def _sfdp_init():
         torch.empty, (2, 8, 4, 16), device=device, requires_grad=True, dtype=torch.half
     )
     b = functools.partial(torch.empty, (1, 1, 8, 8), device=device)
+    cm = functools.partial(torch.empty, (1, 1, 4, 4), device=device, dtype=torch.bool)
     c = functools.partial(torch.tensor, 2.0, device=device)
     # workaround https://github.com/pytorch/pytorch/issues/97894
     # 0.113377 is a "magic" value that lets us recover the lost input arg relationship
     d = {"dropout_p": 0.113377}
+    ds = { "scale" : 1.1234121822, "dropout_p": 0.113377 }
 
-    for pattern, replacement, args, workaround, extra_check in [
-        (
-            _sfdp_pattern_1,
-            _sfdp_replacement_1,
-            [g(), g(), g(), c()],
-            {},
-            _sfdp_scale_factor_check(aten.div.Tensor),
-        ),
-        (
-            _sfdp_pattern_2,
-            _sfdp_replacement_2,
-            [g(), g(), g(), c()],
-            {},
-            _sfdp_scale_factor_check(aten.mul.Tensor),
-        ),
-        (
-            _sfdp_pattern_3,
-            _sfdp_replacement_3,
-            [g(), g(), g(), c()],
-            d,
-            _sfdp_scale_factor_check(aten.div.Tensor),
-        ),
-        (
-            _sfdp_pattern_4,
-            _sfdp_replacement_4,
-            [g(), g(), g(), c()],
-            d,
-            _sfdp_scale_factor_check(aten.mul.Tensor),
-        ),
-        (
-            _sfdp_pattern_5,
-            _sfdp_replacement_5,
-            [g(), g(), g(), b()],
-            {},
-            _sfdp_params_check,
-        ),
-        (
-            _sfdp_pattern_6,
-            _sfdp_replacement_6,
-            [g(), g(), g(), b()],
-            d,
-            _sfdp_params_check,
-        ),
-        (
-            _sfdp_pattern_7,
-            _sfdp_replacement_7,
-            [gp(), gp(), gp()],
-            d,
-            _sfdp_params_check,
-        ),
-        (
-            _sfdp_pattern_8,
-            _sfdp_replacement_8,
-            [gp(), gp(), gp()],
-            {},
-            _sfdp_params_check,
-        ),
-        (
-            _sfdp_pattern_9,
-            _sfdp_replacement_9,
-            [gp(), gp(), gp()],
-            d,
-            _sfdp_params_check,
-        ),
-        (
-            _sfdp_pattern_10,
-            _sfdp_replacement_10,
-            [gp(), gp(), gp()],
-            {},
+    for replacement_pass, pattern, replacement, args, workaround, extra_check in [
+        # (
+        #     pre_constant_fold_patterns,
+        #     _sfdp_pattern_1,
+        #     _sfdp_replacement_1,
+        #     [g(), g(), g(), c()],
+        #     {},
+        #     _sfdp_scale_factor_check(aten.div.Tensor),
+        # ),
+        # (
+        #     pre_constant_fold_patterns,
+        #     _sfdp_pattern_2,
+        #     _sfdp_replacement_2,
+        #     [g(), g(), g(), c()],
+        #     {},
+        #     _sfdp_scale_factor_check(aten.mul.Tensor),
+        # ),
+        # (
+        #     pre_constant_fold_patterns,
+        #     _sfdp_pattern_3,
+        #     _sfdp_replacement_3,
+        #     [g(), g(), g(), c()],
+        #     d,
+        #     _sfdp_scale_factor_check(aten.div.Tensor),
+        # ),
+        # (
+        #     pre_constant_fold_patterns,
+        #     _sfdp_pattern_4,
+        #     _sfdp_replacement_4,
+        #     [g(), g(), g(), c()],
+        #     d,
+        #     _sfdp_scale_factor_check(aten.mul.Tensor),
+        # ),
+        # (
+        #     pre_constant_fold_patterns,
+        #     _sfdp_pattern_5,
+        #     _sfdp_replacement_5,
+        #     [g(), g(), g(), b()],
+        #     {},
+        #     _sfdp_params_check,
+        # ),
+        # (
+        #     pre_constant_fold_patterns,
+        #     _sfdp_pattern_6,
+        #     _sfdp_replacement_6,
+        #     [g(), g(), g(), b()],
+        #     d,
+        #     _sfdp_params_check,
+        # ),
+        # (
+        #     pre_constant_fold_patterns,
+        #     _sfdp_pattern_7,
+        #     _sfdp_replacement_7,
+        #     [gp(), gp(), gp()],
+        #     d,
+        #     _sfdp_params_check,
+        # ),
+        # (
+        #     pre_constant_fold_patterns,
+        #     _sfdp_pattern_8,
+        #     _sfdp_replacement_8,
+        #     [gp(), gp(), gp()],
+        #     {},
+        #     _sfdp_params_check,
+        # ),
+        # (
+        #     pre_constant_fold_patterns,
+        #     _sfdp_pattern_9,
+        #     _sfdp_replacement_9,
+        #     [gp(), gp(), gp()],
+        #     d,
+        #     _sfdp_params_check,
+        # ),
+        # (
+        #     pre_constant_fold_patterns,
+        #     _sfdp_pattern_10,
+        #     _sfdp_replacement_10,
+        #     [gp(), gp(), gp()],
+        #     {},
+        #     _sfdp_params_check,
+        # ),
+         (
+             pre_constant_fold_patterns,
+            _sfdp_pattern_11,
+            _sfdp_replacement_11,
+            [gp(), gp(), gp(), cm()],
+            ds,
             _sfdp_params_check,
         ),
     ]:
@@ -399,7 +464,7 @@ def _sfdp_init():
             replacement,
             args,
             training_graph,
-            patterns,
+            replacement_pass,
             extra_check=extra_check,
             scalar_workaround=workaround,
         )
@@ -408,7 +473,7 @@ def _sfdp_init():
             replacement,
             args,
             inference_graph,
-            patterns,
+            replacement_pass,
             extra_check=extra_check,
             scalar_workaround=workaround,
         )

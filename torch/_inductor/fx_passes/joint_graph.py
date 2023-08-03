@@ -17,6 +17,7 @@ from ..pattern_matcher import (
 from .replace_random import replace_random_passes
 
 log = logging.getLogger(__name__)
+pre_constant_fold_patterns = PatternMatcherPass()
 patterns = PatternMatcherPass()
 
 
@@ -196,6 +197,9 @@ def joint_graph_passes(graph: torch.fx.GraphModule):
     """
     lazy_init()
     count = 0
+
+    if config.pattern_matcher:
+        count += pre_constant_fold_patterns.apply(graph.graph)
 
     if config.joint_graph_constant_folding:
         constant_fold_uniform_value(graph)
